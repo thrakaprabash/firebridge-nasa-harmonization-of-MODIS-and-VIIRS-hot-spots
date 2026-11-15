@@ -1,0 +1,20 @@
+# Local NASA FIRMS data and generated database
+/Modis/
+/VIIRS/
+/hotspots.sqlite
+/hotspots.sqlite-*
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Frontend dependencies and build output
+node_modules/
+/frontend/dist/
+
+# Local environment variables
+.env
+.env.*
+!.env.example
