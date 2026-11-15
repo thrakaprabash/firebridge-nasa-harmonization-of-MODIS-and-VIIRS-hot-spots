@@ -39,6 +39,10 @@ def main():
                         UNIQUE(sensor, satellite, day_utc, time_utc, latitude,
                                longitude, confidence_raw, version, daynight, frp_mw)
                     );
+                    CREATE UNIQUE INDEX hotspots_without_frp
+                        ON hotspots(sensor, satellite, day_utc, time_utc, latitude,
+                                    longitude, confidence_raw, version, daynight)
+                        WHERE frp_mw IS NULL;
                 """)
                 for folder, sensor in (("Modis", "MODIS"), ("VIIRS", "VIIRS")):
                     paths = sorted((ROOT / folder).glob("*.txt"))

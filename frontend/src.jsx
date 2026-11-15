@@ -1,12 +1,31 @@
-import React, {useState,useEffect,useRef} from 'react';
+import React, {lazy,Suspense,useState,useEffect,useRef} from 'react';
 import {createRoot} from 'react-dom/client';
-import Globe from 'react-globe.gl';
-import {AreaChart,Area,XAxis,YAxis,Tooltip,ResponsiveContainer,CartesianGrid,LineChart,Line,ReferenceArea,Legend} from 'recharts';
 import {Flame,Download,Play,Pause,Globe2,RotateCcw,ArrowUpRight,Sun,Moon} from 'lucide-react';
-import {motion} from 'motion/react';
 import FlatMap from './FlatMap';
 import './style.css';
 
+const Globe = lazy(()=>import('react-globe.gl'));
+const ActivityChart = lazy(()=>import('./Charts').then(module=>({default:module.ActivityChart})));
+const ComparisonChart = lazy(()=>import('./Charts').then(module=>({default:module.ComparisonChart})));
+
+class GlobeErrorBoundary extends React.Component {
+  state = {failed:false};
+
+  static getDerivedStateFromError() {
+    return {failed:true};
+  }
+
+  componentDidCatch() {
+    this.props.onFailure();
+  }
+
+  render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
+
+const sensors = ['MODIS','VIIRS'];
+const sensorColors = {MODIS:['#ffab66','#a8460d'],VIIRS:['#a8ebbe','#24714a']};
 const number = value => value == null ? '—' : value.toLocaleString();
 const regions = {
   'worldwide': {name:'Worldwide', bounds:[-180,-90,180,90]},
@@ -30,7 +49,8 @@ function regionView([west,south,east,north]) {
 }
 const comparisonColumns = ['date','phase','modis_detections','viirs_detections','MODIS','VIIRS','viirs_adjusted'];
 
-function coverageLabel(day) {
+function coverageLabel(day,sensor) {
+  if (sensor) return day[sensor]==null ? sensor+' records unavailable' : sensor+' records available';
   if (day.MODIS != null && day.VIIRS != null) return 'Records from both sensors';
   if (day.MODIS != null) return 'MODIS records only';
   if (day.VIIRS != null) return 'VIIRS records only';
@@ -56,56 +76,128 @@ async function get(path,signal) {
   return data;
 }
 function App(){
-  const [mapView,setMapView]=useState('globe');
+  const [mapView,setMapView]=useState('flat');
+  const [globeFailed,setGlobeFailed]=useState(false);
   const [theme,setTheme]=useState(()=>localStorage.getItem('firebridge-theme')==='light'?'light':'dark');
   const light=theme==='light';
   useEffect(()=>{
     document.documentElement.dataset.theme=theme;
     localStorage.setItem('firebridge-theme',theme);
   },[theme]);
-  const [days,setDays]=useState([]),[selected,setSelected]=useState('2026-09-16');
+  const [days,setDays]=useState([]),[selected,setSelected]=useState('');
+  const [calendarLoading,setCalendarLoading]=useState(true);
   const [sensor,setSensor]=useState(''),[points,setPoints]=useState([]),[mapError,setMapError]=useState('');
   const [calendarError,setCalendarError]=useState(''),[comparisonError,setComparisonError]=useState('');
   const [mapRetry,retryMap]=useState(0),[calendarRetry,retryCalendar]=useState(0);
   const [clusters,setClusters]=useState([]),[detailMode,setDetailMode]=useState(false),[listPage,setListPage]=useState(0);
   const [loading,setLoading]=useState(false),[playing,setPlaying]=useState(false),[rotate,setRotate]=useState(false);
   const [comparison,setComparison]=useState(null),[comparing,setComparing]=useState(false);
-  const [study,setStudy]=useState(false),[hotspot,setHotspot]=useState(null);
+  const [areaId,setAreaId]=useState('worldwide');
+  const [group,setGroup]=useState(null),[inspectedGroup,setInspectedGroup]=useState(null);
+  const [hotspot,setHotspot]=useState(null);
+  const [partial,setPartial]=useState(false);
   const [regionId,setRegionId]=useState('northern-australia');
   const region=regions[regionId];
-  const [west,south,east,north]=region.bounds;
+  const area=regions[areaId];
+  const [west,south,east,north]=area.bounds;
   const regionWidth=(east-west+360)%360 || 360;
   const edge=lat=>Array.from({length:Math.ceil(regionWidth)+1},(_,i)=>
     [((west+i*regionWidth/Math.ceil(regionWidth)+540)%360)-180,lat]);
-  const studyOutline=regionId==='worldwide'?[]:[[...edge(south),...edge(north).reverse(),[west,south]]];
+  const studyOutline=areaId==='worldwide'?[]:[[...edge(south),...edge(north).reverse(),[west,south]]];
   const globe=useRef(),container=useRef();
+  const activityChart=useRef();
+  const [showActivityChart,setShowActivityChart]=useState(false);
   const [size,setSize]=useState({width:800,height:550});
   useEffect(()=>{const observer=new ResizeObserver(([entry])=>setSize({width:entry.contentRect.width,height:entry.contentRect.height}));observer.observe(container.current);return()=>observer.disconnect()},[]);
-  const areaName=study?region.name:'Worldwide';
-  const areaQuery=study?'bbox='+region.bounds.join(','):'';
-  const mapQuery=new URLSearchParams({date:selected});
-  if(study) mapQuery.set('bbox',region.bounds.join(','));
-  if(sensor) mapQuery.set('sensor',sensor);
+  useEffect(()=>{
+    const observer=new IntersectionObserver(([entry])=>{
+      if(entry.isIntersecting){
+        setShowActivityChart(true);
+        observer.disconnect();
+      }
+    },{rootMargin:'200px'});
+    observer.observe(activityChart.current);
+    return()=>observer.disconnect();
+  },[]);
+  const areaBounds=areaId==='worldwide'?null:area.bounds;
+  const areaParams=new URLSearchParams();
+  if(areaBounds) areaParams.set('bbox',areaBounds.join(','));
+  if(sensor) areaParams.set('sensor',sensor);
+  const areaQuery=areaParams.toString();
+  const mapQuery=new URLSearchParams(areaQuery);
+  mapQuery.set('date',selected);
   const query=mapQuery.toString();
+  const detailQuery=new URLSearchParams(query);
+  if(inspectedGroup){
+    detailQuery.set('sensor',inspectedGroup.sensor);
+    detailQuery.set('cell',inspectedGroup.lat_cell+','+inspectedGroup.lng_cell);
+  }
+  const requestQuery=detailQuery.toString();
+  const exportQuery=inspectedGroup?requestQuery:query;
+  const shownSensors=sensor?[sensor]:sensors;
+  const activeSensors=inspectedGroup?[inspectedGroup.sensor]:shownSensors;
+  const mapBounds=inspectedGroup?.bounds ?? areaBounds;
+
+  function clearGroup(){
+    setGroup(null);
+    setInspectedGroup(null);
+  }
+
+  function recoverGlobe(){
+    setRotate(false);
+    setMapView('flat');
+    setGlobeFailed(true);
+  }
+
+  function chooseDate(date){
+    setSelected(date);
+    clearGroup();
+  }
+
+  function openGroup(point){
+    setPlaying(false);
+    setGroup(point);
+  }
+
+  function inspectGroup(){
+    const west=group.lng_cell*5-180, south=group.lat_cell*5-90;
+    setInspectedGroup({...group,bounds:[west,south,west+5,south+5]});
+    setGroup(null);
+    setDetailMode(true);
+  }
+
+  useEffect(()=>{
+    globe.current?.pointOfView(mapBounds?regionView(mapBounds):overview,650);
+  },[mapBounds]);
   useEffect(()=>{
     const controller=new AbortController();
-    setDays([]);setCalendarError('');
+    setDays([]);setCalendarError('');setCalendarLoading(true);
     get('/api/daily?'+areaQuery,controller.signal)
-      .then(data=>{if(!controller.signal.aborted)setDays(data.days)})
-      .catch(error=>{if(!controller.signal.aborted)setCalendarError(error.message)});
+      .then(({days:availableDays})=>{
+        if(controller.signal.aborted) return;
+        setDays(availableDays);
+        setSelected(previous=>availableDays.some(day=>day.date===previous)
+          ? previous
+          : availableDays.findLast(day=>day.MODIS!=null||day.VIIRS!=null)?.date ?? '');
+      })
+      .catch(error=>{if(!controller.signal.aborted)setCalendarError(error.message)})
+      .finally(()=>{if(!controller.signal.aborted)setCalendarLoading(false)});
     return()=>controller.abort();
   },[areaQuery,calendarRetry]);
   useEffect(()=>{
     const controller=new AbortController();
-    setLoading(true);setMapError('');setPoints([]);setClusters([]);setHotspot(null);setListPage(0);
+    setLoading(Boolean(selected));setMapError('');setPoints([]);setClusters([]);setHotspot(null);setListPage(0);setPartial(false);
+    if(!selected) return;
     const request=detailMode
-      ? Promise.all((sensor?[sensor]:['MODIS','VIIRS']).map(name=>{
-        const params=new URLSearchParams(query);
+      ? Promise.all((inspectedGroup?[inspectedGroup.sensor]:sensor?[sensor]:sensors).map(name=>{
+        const params=new URLSearchParams(requestQuery);
         params.set('sensor',name);
         params.set('limit','1000');
         return get('/api/hotspots?'+params,controller.signal);
       })).then(results=>{
-        if(!controller.signal.aborted)setPoints(results.flatMap(data=>data.features.map(f=>({
+        if(controller.signal.aborted) return;
+        setPartial(results.some(data=>data.next_after!=null));
+        setPoints(results.flatMap(data=>data.features.map(f=>({
           ...f.properties,id:f.id,lat:f.geometry.coordinates[1],lng:f.geometry.coordinates[0],
         }))));
       })
@@ -115,7 +207,7 @@ function App(){
     request.catch(error=>{if(!controller.signal.aborted)setMapError(error.message)})
       .finally(()=>{if(!controller.signal.aborted)setLoading(false)});
     return()=>controller.abort();
-  },[query,sensor,detailMode,mapRetry]);
+  },[selected,requestQuery,sensor,inspectedGroup,detailMode,mapRetry]);
   const mapPoints=detailMode?points:clusters;
   function selectHotspot(point){
     setPlaying(false);
@@ -123,18 +215,21 @@ function App(){
     globe.current?.pointOfView({lat:point.lat,lng:point.lng,altitude:.8},600);
   }
   useEffect(()=>{if(globe.current){globe.current.controls().autoRotate=rotate;globe.current.controls().autoRotateSpeed=.35}},[rotate]);
-  useEffect(()=>{if(!playing||!days.length||loading)return;const timer=setTimeout(()=>setSelected(days[(days.findIndex(d=>d.date===selected)+1)%days.length].date),1800);return()=>clearTimeout(timer)},[playing,days,selected,loading]);
+  useEffect(()=>{if(!playing||!days.length||loading)return;const timer=setTimeout(()=>chooseDate(days[(days.findIndex(d=>d.date===selected)+1)%days.length].date),1800);return()=>clearTimeout(timer)},[playing,days,selected,loading]);
   const current=days.find(d=>d.date===selected)||{};
-  const shownSensors=sensor?[sensor]:['MODIS','VIIRS'];
-  const total=shownSensors.reduce((sum,name)=>sum+(current[name]??0),0);
+  const count=day=>shownSensors.reduce((sum,name)=>sum+(day[name]??0),0);
+  const total=inspectedGroup?.count ?? (days.length?count(current):null);
   const hasRecords=shownSensors.some(name=>current[name]!=null);
-  const mapStatus=loading?'Loading observations…':detailMode
-    ? (mapError?'':!days.length?'Showing '+number(points.length)+' records':!hasRecords?'No records available for this selection':total===0?'No matching detections':(points.length<total?'Partial view · ':'')+number(points.length)+' of '+number(total)+' detections')
+  const mapStatus=loading||calendarLoading?'Loading observations.'
+    : mapError||(!selected&&calendarError)?'':!selected?'No observation dates available.':detailMode
+    ? points.length ? 'Showing '+number(points.length)+(total!=null?' of '+number(total):'')+' detections'
+      : days.length&&!hasRecords?'No records available for this selection':'No matching detections'
     : clusters.length?number(clusters.reduce((sum,cell)=>sum+cell.count,0))+' detections grouped in 5° map cells'
-    : !days.length?'':hasRecords?'No matching detections':'No records available for this selection';
-  const max=Math.max(1,...days.map(d=>(d.MODIS||0)+(d.VIIRS||0)));
+    : days.length&&!hasRecords?'No records available for this selection':'No matching detections';
+  const max=Math.max(1,...days.map(count));
+  const datasetPeriod=days.length ? days[0].date+' to '+days.at(-1).date+' UTC' : '';
   async function compare(){
-    setComparing(true);setComparisonError('');
+    setComparing(true);setComparisonError('');setComparison(null);
     try {
       setComparison(await get('/api/comparison?bbox='+region.bounds.join(',')));
     } catch(e) {
@@ -144,13 +239,61 @@ function App(){
     }
   }
   return <div className="shell">
-    <aside><a className="brand" href="#top"><Flame size={30}/> <span>firebridge<span className="brand-dot">.</span></span></a><div className="side-label">WORKSPACE</div><a className="nav active" href="#top"><Globe2 size={18}/> Earth observatory</a><a className="nav" href="#calendar">Burning calendar <ArrowUpRight size={16}/></a><a className="nav" href="#compare">Sensor comparison <ArrowUpRight size={16}/></a><div className="side-bottom"><span className="status-dot"/> NASA FIRMS data<p>MODIS · VIIRS NOAA-21<br/>September–October 2026</p></div></aside>
-    <main id="top"><header><div><div className="eyebrow">EARTH OBSERVATION / ACTIVE FIRE</div><h1>A planet in motion.</h1><p>Explore satellite detections. Understand burning activity.</p></div><div className="header-actions"><button type="button" className="button" onClick={()=>setTheme(light?'dark':'light')}>{light?<Moon size={16}/>:<Sun size={16}/>} {light?'Dark mode':'Light mode'}</button><a className="button" href={'/api/export?'+query}><Download size={16}/> Export detections</a></div></header>
-    <p className="view-scope"><strong>{areaName}</strong> · {selected} UTC · {sensor||"Both instruments"}</p><section className="stats">{[...(sensor!=='VIIRS'?[['MODIS detections',current.MODIS,'Terra + Aqua']]:[]),...(sensor!=='MODIS'?[['VIIRS detections',current.VIIRS,'NOAA-21 · 375 m']]:[]),['Observation date',selected,'UTC acquisition date']].map(([label,value,note],i)=><motion.div className="stat" key={label} initial={{opacity:0,y:12}} animate={{opacity:1,y:0}} transition={{delay:i*.1}}><label>{label}</label><strong>{typeof value==='string'?value:number(value)}</strong><small>{note}</small></motion.div>)}</section>
-    <section className="earth-panel"><div className="map-toolbar"><div><span className="status-dot"/> {study?region.name:"Global observations"}</div><div className="header-actions"><select aria-label="Map layer" value={detailMode?"details":"clusters"} onChange={e=>setDetailMode(e.target.value==="details")}><option value="clusters">Grouped detections</option><option value="details">Individual hotspots</option></select><select aria-label="Map view" value={mapView} onChange={event=>{setMapView(event.target.value);setRotate(false);setHotspot(null)}}><option value="globe">3D globe</option><option value="flat">Flat map</option></select><button className="button" onClick={()=>{setStudy(!study);setRotate(false);globe.current?.pointOfView(study||regionId==='worldwide'?overview:regionView(region.bounds),900)}}>{study?"Show worldwide":mapView==="flat"?"Show study area":"Fly to study area"}</button><select aria-label="Sensor" value={sensor} onChange={e=>setSensor(e.target.value)}><option value="">Both instruments</option><option>MODIS</option><option>VIIRS</option></select></div></div>
-    <div ref={container} className="globe">{mapView==="flat"?<FlatMap light={light} points={mapPoints} selected={hotspot} bounds={study&&regionId!=="worldwide"?region.bounds:null} onPointClick={detailMode?selectHotspot:undefined}/>:<Globe ref={globe} width={size.width} height={size.height} backgroundColor={light?'#e5effa':'#060e21'} globeImageUrl={light ? "https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg" : "https://unpkg.com/three-globe/example/img/earth-night.jpg"} bumpImageUrl="https://unpkg.com/three-globe/example/img/earth-topology.png" atmosphereColor={light ? "#87baf4" : "#65adff"} atmosphereAltitude={.16} pointsData={mapPoints} pointLat="lat" pointLng="lng" pointColor={d=>d.sensor==='MODIS'?'#ffab66':'#a8ebbe'} pointAltitude={point=>point===hotspot ? .01 : .007} pointRadius={point=>point===hotspot ? .35 :point.count?Math.min(.75,.16+Math.log10(point.count)*.14):.13} pointsMerge={!detailMode} pointResolution={5} pointsTransitionDuration={0} onPointClick={detailMode?selectHotspot:undefined} pathsData={study?studyOutline:[]} pathPointLat={point=>point[1]} pathPointLng={point=>point[0]} pathPointAlt={.01} pathResolution={1} pathColor={()=>light?"#124eaa":"#78ceff"} pathStroke={1.5} onGlobeReady={()=>globe.current.pointOfView(study&&regionId!=="worldwide"?regionView(region.bounds):overview,1200)}/>}</div>
-    <div className="map-caption"><div className="legend"><span className="orange"/> MODIS <span className="green"/> VIIRS</div><span role="status">{mapStatus}</span><button disabled={mapView==="flat"} aria-label="Toggle globe rotation" onClick={()=>setRotate(!rotate)}><RotateCcw size={16}/>{rotate?'Stop rotation':'Rotate'}</button></div>
+    <aside><a className="brand" href="#top"><Flame size={30}/> <span>firebridge<span className="brand-dot">.</span></span></a><div className="side-label">WORKSPACE</div><nav className="desktop-nav" aria-label="Workspace"><a className="nav" href="#map"><Globe2 size={18}/> Earth observatory</a><a className="nav" href="#calendar">Burning calendar <ArrowUpRight size={16}/></a><a className="nav" href="#compare">Sensor comparison <ArrowUpRight size={16}/></a></nav><div className="side-bottom"><span className="status-dot"/> NASA FIRMS data<p>MODIS · VIIRS NOAA-21</p></div></aside>
+    <main id="top"><header><div><div className="eyebrow">EARTH OBSERVATION / ACTIVE FIRE</div><h1>Explore active fire detections</h1><p>Explore and compare satellite observations from MODIS and VIIRS.</p></div><div className="header-actions"><button type="button" className="button" onClick={()=>setTheme(light?'dark':'light')}>{light?<Moon size={16}/>:<Sun size={16}/>} {light?'Dark mode':'Light mode'}</button>{selected?<a className="button" href={'/api/export?'+exportQuery}><Download size={16}/> {inspectedGroup?'Export group detections':'Export detections'}</a>:<button type="button" className="button" disabled><Download size={16}/> Export detections</button>}</div></header>
+    <nav className="mobile-nav" aria-label="Workspace"><a href="#map">Map</a><a href="#calendar">Calendar</a><a href="#compare">Comparison</a></nav>
+    <section className="stats">{[...(sensor!=='VIIRS'?[['MODIS detections',current.MODIS,'Terra + Aqua']]:[]),...(sensor!=='MODIS'?[['VIIRS detections',current.VIIRS,'NOAA-21 · 375 m']]:[]),['Observation date',selected,'UTC acquisition date']].map(([label,value,note])=><div className="stat" key={label}><label>{label}</label><strong>{typeof value==='string'?value:number(value)}</strong><small>{note}</small></div>)}</section>
+    <section className="earth-panel" id="map" aria-labelledby="map-heading">
+      <div className="map-toolbar">
+        <div><h2 id="map-heading">Earth observatory</h2>{datasetPeriod&&<p>Dataset period · {datasetPeriod}</p>}</div>
+        <div className="map-filters">
+          <label>Area<select value={areaId} onChange={event=>{setAreaId(event.target.value);setRotate(false);clearGroup()}}>
+            {Object.entries(regions).map(([id,preset])=><option key={id} value={id}>{preset.name}</option>)}
+          </select></label>
+          <label>Date (UTC)<select value={selected} onChange={event=>chooseDate(event.target.value)} disabled={!days.length}>
+            {!selected&&<option value="" disabled>{calendarLoading?'Loading dates…':'Select a date'}</option>}
+            {days.map(day=><option key={day.date}>{day.date}</option>)}
+          </select></label>
+          <label>Sensor<select value={sensor} onChange={event=>{setSensor(event.target.value);clearGroup()}}>
+            <option value="">Both instruments</option><option>MODIS</option><option>VIIRS</option>
+          </select></label>
+        </div>
+        <div className="map-filters map-display">
+          <label>Map view<select value={mapView} onChange={event=>{setMapView(event.target.value);setRotate(false)}}>
+            <option value="globe" disabled={globeFailed}>3D globe</option><option value="flat">Flat map</option>
+          </select></label>
+          <label>Display mode<select value={detailMode?'details':'clusters'} onChange={event=>{clearGroup();setDetailMode(event.target.value==='details')}}>
+            <option value="clusters">Grouped detections</option><option value="details">Individual hotspots</option>
+          </select></label>
+        </div>
+      </div>
+      {inspectedGroup&&<div className="group-panel"><p>{inspectedGroup.sensor} group · {number(inspectedGroup.count)} detections</p><button className="button" onClick={()=>{clearGroup();setDetailMode(false)}}>Back to grouped detections</button></div>}
+    {globeFailed&&<p className="panel-feedback" role="status">The 3D globe could not load. Showing the flat map.</p>}
+    <div ref={container} className="globe">{mapView==="flat"?<FlatMap light={light} points={mapPoints} selected={hotspot??group} bounds={mapBounds} onPointClick={detailMode?selectHotspot:openGroup}/>:<GlobeErrorBoundary onFailure={recoverGlobe}><Suspense fallback={<p className="map-placeholder" role="status">Loading 3D globe.</p>}><Globe ref={globe} width={size.width} height={size.height} backgroundColor={light?'#e5effa':'#060e21'} globeImageUrl={light ? "https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg" : "https://unpkg.com/three-globe/example/img/earth-night.jpg"} bumpImageUrl="https://unpkg.com/three-globe/example/img/earth-topology.png" atmosphereColor={light ? "#87baf4" : "#65adff"} atmosphereAltitude={.16} pointsData={mapPoints} pointLat="lat" pointLng="lng" pointColor={d=>d.sensor==='MODIS'?'#ffab66':'#a8ebbe'} pointAltitude={point=>(point===hotspot || point===group) ? .01 : .007} pointRadius={point=>(point===hotspot || point===group) ? .35 :point.count?Math.min(.75,.16+Math.log10(point.count)*.14):.13} pointsMerge={false} pointResolution={5} pointsTransitionDuration={0} onPointClick={detailMode?selectHotspot:openGroup} pathsData={studyOutline} pathPointLat={point=>point[1]} pathPointLng={point=>point[0]} pathPointAlt={.01} pathResolution={1} pathColor={()=>light?"#124eaa":"#78ceff"} pathStroke={1.5} onGlobeReady={()=>globe.current?.pointOfView(mapBounds?regionView(mapBounds):overview,850)}/></Suspense></GlobeErrorBoundary>}</div>
+    <div className="map-caption">
+      <div className="legend">{activeSensors.map(name=><span key={name}><i style={{background:sensorColors[name][+light]}}/> {name}</span>)}</div>
+      <span role="status">{mapStatus}</span>
+      {mapView==='globe'&&<button type="button" onClick={()=>setRotate(!rotate)}><RotateCcw size={16}/>{rotate?'Stop rotation':'Rotate'}</button>}
+    </div>
+    {partial&&<p className="panel-feedback">Hotspots are limited to 1,000 per sensor. {inspectedGroup?'Export group detections to download all records in this group.':'Choose a smaller area or select a group to inspect its hotspots.'}</p>}
+    {group&&<section className="group-panel" aria-label="Selected detection group">
+      <h3>{group.sensor} group · {number(group.count)} detections</h3>
+      <button className="button" onClick={inspectGroup}>View hotspots in this area</button>
+      <button className="button" onClick={()=>setGroup(null)}>Close group</button>
+    </section>}
     {mapError && <p className="panel-feedback" role="alert">Map observations could not load. <button className="button" onClick={()=>retryMap(value=>value+1)}>Retry map</button></p>}
+    {!detailMode && clusters.length>0 && <details className="visible-hotspots">
+      <summary>Browse detection groups ({number(clusters.length)})</summary>
+      <label>Detection group <select value={group?clusters.indexOf(group):''} onChange={event=>{
+        if(event.target.value==='') setGroup(null);
+        else openGroup(clusters[Number(event.target.value)]);
+      }}>
+        <option value="">Select a group</option>
+        {clusters.map((cell,index)=><option key={cell.sensor+':'+cell.lat_cell+':'+cell.lng_cell} value={index}>
+          {cell.sensor} · {number(cell.count)} detections · {cell.lat.toFixed(1)}, {cell.lng.toFixed(1)}
+        </option>)}
+      </select></label>
+    </details>}
     {detailMode && points.length>0 && <details className="visible-hotspots">
       <summary>Visible hotspots ({number(points.length)})</summary>
       <ul>{points.slice(listPage*10,listPage*10+10).map(point=><li key={point.id}>
@@ -166,31 +309,55 @@ function App(){
       <p>{hotspot.lat.toFixed(4)}°, {hotspot.lng.toFixed(4)}° · Confidence {hotspot.confidence_raw ?? 'Unavailable'} · Fire radiative power {hotspot.frp_mw == null ? 'Unavailable' : hotspot.frp_mw+' MW'}</p>
     </div>}</section>
     {calendarError&&<p className="panel-feedback" role="alert">Daily counts could not load. <button className="button" onClick={()=>retryCalendar(value=>value+1)}>Retry counts</button></p>}
-    <section className="timeline"><button className="play" aria-label={playing?'Pause timeline':'Play timeline'} onClick={()=>setPlaying(!playing)}>{playing?<Pause size={18}/>:<Play size={18}/>}</button><input aria-label="Observation day" disabled={!days.length} type="range" min="0" max={Math.max(0,days.length-1)} value={Math.max(0,days.findIndex(d=>d.date===selected))} onChange={e=>setSelected(days[+e.target.value].date)}/><time>{selected}</time><small>{days.length ? coverageLabel(current) : ""}</small></section>
-    <section className="lower"><div className="panel" id="calendar"><div className="section-heading"><div><h2>Burning calendar</h2><p>Daily hotspot detections · UTC</p></div><span>20-day window</span></div><div className="calendar">{days.map(d=><button key={d.date} title={d.date+' · MODIS '+number(d.MODIS)+' · VIIRS '+number(d.VIIRS)} className={selected===d.date?'selected':''} style={{backgroundColor:'rgba(70,139,228,'+(.08+.65*((d.MODIS||0)+(d.VIIRS||0))/max)+')'}} onClick={()=>setSelected(d.date)}><small>{d.date.slice(5,7)==='09'?'SEP':'OCT'}</small><strong>{d.date.slice(-2)}</strong>{d.MODIS===null&&<span title="MODIS data unavailable">—</span>}</button>)}</div><p className="footnote">Coverage labels indicate records in the dataset. Counts are for {areaName}.</p></div>
-    <div className="panel"><h2>Activity through time</h2><p>Raw detections by instrument</p><div className="chart"><ResponsiveContainer width="100%" height="100%"><AreaChart data={days}><CartesianGrid stroke={light?'#cfdaea':'#243759'} vertical={false}/><XAxis dataKey="date" tickFormatter={v=>v.slice(5)} tick={{fill:light?'#435773':'#91a1b3',fontSize:10}}/><YAxis width={45} tickFormatter={v=>v/1000+'k'} tick={{fill:light?'#435773':'#91a1b3',fontSize:10}}/><Tooltip contentStyle={{background:light?'#ffffff':'#102548',border:'1px solid #7890ae',borderRadius:10}}/><Area dataKey="VIIRS" stroke={light?'#24714a':'#a8ebbe'} fill="#a8ebbe" fillOpacity={.08}/><Area dataKey="MODIS" stroke={light?'#a8460d':'#ffab66'} fill="#ffab66" fillOpacity={.12}/></AreaChart></ResponsiveContainer></div></div></section>
-    <section className="panel comparison" id="compare"><div><div className="eyebrow">EXPERIMENTAL ANALYSIS</div><h2>{region.name} sensor comparison</h2><p>Compare detected active cells on a common 1 km equal-area grid.<br/>This comparison uses the full available date range and both sensors. Presets use geographic rectangles. The first 70% of shared days are used for fitting.</p></div><div className="header-actions"><select aria-label="Comparison region" value={regionId} disabled={comparing} onChange={event=>{
-      const next=event.target.value;
-      setComparisonError('');setRegionId(next);
-      setComparison(null);
-      if(study) globe.current?.pointOfView(next==='worldwide'?overview:regionView(regions[next].bounds),900);
-    }}>{Object.entries(regions).map(([id,preset])=><option key={id} value={id}>{preset.name}</option>)}</select><button className="button" disabled={comparing} onClick={compare}>{comparing?'Calculating…':'Run comparison'} <ArrowUpRight size={16}/></button></div>{comparisonError&&<p role="alert">Comparison could not load. <button className="button" onClick={compare}>Retry comparison</button></p>}{comparison&&!comparison.validation&&<p role="status">There are too few usable paired observations to fit and evaluate an adjustment for this area.</p>}{comparison&&<div className="results">{comparison.validation&&<span>Average difference from MODIS<strong>{comparison.validation.raw_mae.toFixed(1)} → {comparison.validation.adjusted_mae.toFixed(1)}</strong> Active cells/day · {region.name} · {comparison.validation.holdout_days} held-out days</span>}<span>VIIRS adjustment <strong>{comparison.factor?.toFixed(3)??'Insufficient data'}</strong></span><span>Unadjusted holdout MAE <strong>{comparison.validation?.raw_mae.toFixed(1)??'—'}</strong></span><span>Adjusted holdout MAE <strong>{comparison.validation?.adjusted_mae.toFixed(1)??'—'}</strong></span></div>}</section>
+    <section className="timeline"><button className="play" aria-label={playing?'Pause timeline':'Play timeline'} disabled={!days.length} onClick={()=>setPlaying(!playing)}>{playing?<Pause size={18}/>:<Play size={18}/>}</button><input aria-label="Observation day" disabled={!days.length} type="range" min="0" max={Math.max(0,days.length-1)} value={Math.max(0,days.findIndex(d=>d.date===selected))} aria-valuetext={selected} onChange={e=>chooseDate(days[+e.target.value].date)}/><time>{selected}</time><small>{days.length ? coverageLabel(current,sensor) : ""}</small></section>
+    <section className="lower">
+      <div className="panel" id="calendar">
+        <div className="section-heading"><div><h2>Burning calendar</h2><p>Daily hotspot detections · UTC</p></div>{days.length>0&&<span>{days.length}-day window</span>}</div>
+        <div className="calendar">{days.map(day=>{
+          const date=new Date(day.date+'T00:00:00Z');
+          const label=day.date+' · '+shownSensors.map(name=>name+' '+(day[name]==null?'unavailable':number(day[name]))).join(' · ');
+          return <button key={day.date} title={label} aria-label={label} aria-pressed={selected===day.date}
+            className={selected===day.date?'selected':''} style={{backgroundColor:'rgba(70,139,228,'+(.08+.65*count(day)/max)+')'}}
+            onClick={()=>chooseDate(day.date)}>
+            <small>{date.toLocaleDateString('en',{month:'short',timeZone:'UTC'}).toUpperCase()}</small><strong>{day.date.slice(-2)}</strong>
+            {shownSensors.some(name=>day[name]==null)&&<span aria-hidden="true">–</span>}
+          </button>;
+        })}</div>
+        <p className="footnote">Counts are for {area.name}. A dash marks missing sensor data.</p>
+      </div>
+      <div className="panel">
+        <h2>Activity through time</h2><p>Raw detections by instrument · {area.name}</p>
+          <div ref={activityChart} className="chart">
+          {showActivityChart&&<Suspense fallback={<p role="status">Loading chart.</p>}>
+            <ActivityChart days={days} light={light} shownSensors={shownSensors} sensorColors={sensorColors}/>
+          </Suspense>}
+        </div>
+      </div>
+    </section>
+    <section className="panel comparison" id="compare">
+      <div><h2>{region.name} sensor comparison</h2><p>Both sensors · Full dataset period</p><p>Compares detections on a common 1 km equal-area grid. The adjustment is fitted on the first 70% of shared days.</p></div>
+      <div className="header-actions"><label>Comparison region <select value={regionId} disabled={comparing} onChange={event=>{
+        setRegionId(event.target.value);
+        setComparisonError('');
+        setComparison(null);
+      }}>{Object.entries(regions).map(([id,preset])=><option key={id} value={id}>{preset.name}</option>)}</select></label>
+      <button className="button" disabled={comparing} onClick={compare}>{comparing?'Calculating…':'Run comparison'} <ArrowUpRight size={16}/></button></div>
+      {comparisonError&&<p role="alert">Comparison could not load. <button className="button" onClick={compare}>Retry comparison</button></p>}
+      {comparison&&!comparison.validation&&<p role="status">There are too few usable paired observations to fit and evaluate an adjustment for this area.</p>}
+      {comparison?.validation&&<div className="results" role="status">
+        <div><h3>Average difference from MODIS on held-out days</h3><div className="comparison-metrics">
+          <span>Before adjustment<strong>{comparison.validation.raw_mae.toFixed(1)}</strong> detected cells per day</span>
+          <span>After adjustment<strong>{comparison.validation.adjusted_mae.toFixed(1)}</strong> detected cells per day</span>
+          <span>VIIRS adjustment factor<strong>{comparison.factor.toFixed(3)}×</strong></span>
+        </div></div>
+      </div>}
+    </section>
     {comparison && <section className="panel" style={{marginTop:20}}>
-      <div className="section-heading"><h2>Daily detections and adjusted activity</h2><button className="button" onClick={()=>downloadComparison(comparison.days,regionId)}><Download size={16}/> Download comparison CSV</button></div>
-      <div className="chart comparison-chart"><ResponsiveContainer width="100%" height="100%">
-        <LineChart data={comparison.days}>
-          <CartesianGrid stroke={light?'#cfdaea':'#243759'} vertical={false}/>
-          <XAxis dataKey="date" tickFormatter={value=>value.slice(5)} tick={{fill:light?'#435773':'#91a1b3',fontSize:10}}/>
-          <YAxis tick={{fill:light?'#435773':'#91a1b3',fontSize:10}}/>
-          <Tooltip contentStyle={{background:light?'#fff':'#102548',border:'1px solid #7890ae'}}/>
-          <Legend/>
-          {comparison.validation && <ReferenceArea x1={comparison.validation.holdout_start} x2={comparison.validation.holdout_end} fill="#448bde" fillOpacity={.22} label={{value:'Held-out days',position:'insideTopRight',fill:light?'#173c6b':'#b7d9ff',fontSize:11}}/>}
-          <Line dataKey="MODIS" name="MODIS cells" stroke={light?'#a8460d':'#ffab66'} strokeWidth={2} dot={false}/>
-          <Line dataKey="VIIRS" name="Original VIIRS cells" stroke={light?'#24714a':'#a8ebbe'} strokeWidth={2} dot={false}/>
-          <Line dataKey="viirs_adjusted" name="Adjusted VIIRS cells" stroke={light?'#155ab4':'#78bdff'} strokeWidth={2} strokeDasharray="5 3" dot={false}/>
-        </LineChart>
-      </ResponsiveContainer></div>
-      <p>MAE is measured in detected grid cells per UTC day. Each cell counts once per sensor per day.</p>
+      <div className="section-heading"><h2>Detected grid cells per day</h2><button className="button" onClick={()=>downloadComparison(comparison.days,regionId)}><Download size={16}/> Download comparison CSV</button></div>
+      <Suspense fallback={<div className="chart comparison-chart" role="status">Loading chart.</div>}>
+        <ComparisonChart comparison={comparison} light={light}/>
+      </Suspense>
+      <p>Average difference is the mean absolute error in detected grid cells per UTC day. Each cell counts once per sensor per day.</p>
       {comparison.validation && <p>Fit on {comparison.validation.training_days} days. Tested on {comparison.validation.holdout_days} days ({comparison.validation.holdout_start} to {comparison.validation.holdout_end}).</p>}
       <div style={{overflowX:'auto'}}>
         <table className="comparison-table">
@@ -204,7 +371,7 @@ function App(){
         </table>
       </div>
     </section>}
-    <footer>NASA FIRMS · Near-real-time observations <span>Hotspot detections may represent repeated observations of the same fire. Seasonal analysis requires a longer historical record.</span></footer></main></div>
+    <footer>Historical NASA FIRMS observations <span>Hotspot detections may represent repeated observations of the same fire. Seasonal analysis requires a longer historical record.</span></footer></main></div>
 }
 createRoot(document.getElementById('root')).render(<App/>);
 

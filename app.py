@@ -16,6 +16,8 @@ app.config["FRONTEND_ORIGINS"] = os.getenv(
     "FIREBRIDGE_FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
 ).split(",")
 SENSORS = ("MODIS", "VIIRS")
+MAP_LAT_CELL = "min(35, cast((latitude+90)/5 AS integer))"
+MAP_LNG_CELL = "min(71, cast((longitude+180)/5 AS integer))"
 FIELDS = ("sensor, satellite, day_utc, time_utc, latitude, longitude, "
           "confidence_raw, version, daynight, frp_mw, source_file")
 
@@ -57,7 +59,12 @@ def unavailable(error):
 
 @app.get("/api/health")
 def health():
-    database().execute("SELECT day_utc FROM hotspots LIMIT 1").fetchone()
+    db = database()
+    observation = db.execute(f"SELECT rowid, {FIELDS} FROM hotspots LIMIT 1").fetchone()
+    db.execute("SELECT sensor, satellite, day_utc, detections FROM daily_counts LIMIT 0")
+    db.execute("SELECT day_utc FROM shared_dates LIMIT 0")
+    if observation is None:
+        raise sqlite3.OperationalError("The database contains no observations")
     return jsonify(status="ok")
 
 
@@ -73,19 +80,33 @@ def coverage():
     ])
 
 
-def filters(default_bbox=None):
-    db = database()
-    first, last = db.execute("SELECT min(day_utc), max(day_utc) FROM daily_counts").fetchone()
-    if first is None:
-        raise ValueError("The database contains no observations")
-    day = request.args.get("date")
+def parse_date(value):
     try:
-        start = date.fromisoformat(day or request.args.get("start", first))
-        end = date.fromisoformat(day or request.args.get("end", last))
+        parsed = date.fromisoformat(value)
+        if parsed.isoformat() != value:
+            raise ValueError
     except ValueError:
         raise ValueError("Use YYYY-MM-DD for date, start, and end") from None
-    if day and ("start" in request.args or "end" in request.args):
+    return parsed
+
+
+def filters(default_bbox=None):
+    day = request.args.get("date")
+    if day is not None and ("start" in request.args or "end" in request.args):
         raise ValueError("Use date or start/end")
+    if day is not None:
+        start = end = parse_date(day)
+    else:
+        start = parse_date(request.args["start"]) if "start" in request.args else None
+        end = parse_date(request.args["end"]) if "end" in request.args else None
+        if start is None or end is None:
+            first, last = database().execute(
+                "SELECT min(day_utc), max(day_utc) FROM daily_counts"
+            ).fetchone()
+            if first is None:
+                raise sqlite3.OperationalError("The database contains no observations")
+            start = start or parse_date(first)
+            end = end or parse_date(last)
     if not 0 <= (end - start).days <= 366:
         raise ValueError("Choose an ordered date range spanning at most 367 days")
     sensor = request.args.get("sensor", "").upper()
@@ -149,9 +170,24 @@ def daily():
     return jsonify(metric="hotspot_detections", days=calendar(*filters()))
 
 
+def filter_map_cell(where, params):
+    cell = request.args.get("cell")
+    if cell is None:
+        return where, params
+    try:
+        lat_cell, lng_cell = map(int, cell.split(","))
+    except ValueError:
+        raise ValueError("cell must contain a latitude and longitude cell index") from None
+    if not (0 <= lat_cell < 36 and 0 <= lng_cell < 72):
+        raise ValueError("cell indices are outside the map grid")
+    return (f"{where} AND {MAP_LAT_CELL} = ? AND {MAP_LNG_CELL} = ?",
+            [*params, lat_cell, lng_cell])
+
+
 @app.get("/api/hotspots")
 def hotspots():
     _, _, _, where, params = filters()
+    where, params = filter_map_cell(where, params)
     try:
         limit = int(request.args.get("limit", "2000"))
         after = int(request.args.get("after", "0"))
@@ -179,10 +215,10 @@ def map_clusters():
         raise ValueError("Choose one observation date for the map")
     db = database()
     rows = db.execute(
-        "SELECT sensor, avg(latitude) AS lat, avg(longitude) AS lng, count(*) AS count "
+        "SELECT sensor, avg(latitude) AS lat, avg(longitude) AS lng, count(*) AS count, "
+        f"{MAP_LAT_CELL} AS lat_cell, {MAP_LNG_CELL} AS lng_cell "
         f"FROM hotspots WHERE {where} "
-        "GROUP BY sensor, min(35, cast((latitude+90)/5 AS integer)), "
-        "min(71, cast((longitude+180)/5 AS integer))",
+        "GROUP BY sensor, lat_cell, lng_cell",
         params,
     ).fetchall()
     clusters = [dict(row) for row in rows]
@@ -236,23 +272,23 @@ def export():
     selected = filters()
     if kind == "daily":
         columns = ["date", *([selected[2]] if selected[2] else SENSORS)]
+        rows = ([day[column] for column in columns] for day in calendar(*selected))
     elif kind == "hotspots":
         columns = FIELDS.split(", ")
+        where, params = filter_map_cell(selected[3], selected[4])
+        query = f"SELECT {FIELDS} FROM hotspots WHERE {where} ORDER BY day_utc, rowid"
+        # Validate the query before Flask sends the CSV response headers.
+        database().execute(query + " LIMIT 0", params)
     else:
         raise ValueError("kind must be hotspots or daily")
 
     @stream_with_context
     def generate():
-        if kind == "daily":
-            rows = ([day[column] for column in columns] for day in calendar(*selected))
-        else:
-            rows = database().execute(
-                f"SELECT {FIELDS} FROM hotspots WHERE {selected[3]} ORDER BY day_utc, rowid", selected[4]
-            )
+        records = database().execute(query, params) if kind == "hotspots" else rows
         buffer = io.StringIO(newline="")
         writer = csv.writer(buffer)
         writer.writerow(columns)
-        for index, row in enumerate(rows, 1):
+        for index, row in enumerate(records, 1):
             writer.writerow(row)
             if index % 2000 == 0:
                 yield buffer.getvalue()

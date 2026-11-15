@@ -68,3 +68,61 @@
 .flat-map circle:not([data-hotspot]) { cursor:inherit; }
 .results { flex-wrap:wrap; }
 
+.mobile-nav { display:none; }
+.map-toolbar {
+  position:static;
+  padding:16px 20px;
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:flex-start;
+  align-items:flex-end;
+  gap:12px 24px;
+  background:#0c1933;
+  border-bottom:1px solid #233858;
+}
+.map-toolbar p { margin:4px 0 0; }
+.map-filters,.comparison-metrics { display:flex; flex-wrap:wrap; gap:10px 16px; }
+.map-filters label,.comparison label { display:grid; gap:4px; font-size:12px; }
+.map-filters select,.comparison select { width:100%; min-height:40px; }
+.map-display { margin-inline-start:auto; }
+.map-placeholder { display:grid; place-items:center; height:100%; margin:0; }
+.group-panel {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:8px 12px;
+  padding:12px 20px;
+  border-bottom:1px solid #233858;
+}
+.group-panel h3,.results h3 { font-size:14px; font-weight:600; margin:0; }
+.legend span { display:inline-flex; align-items:center; gap:5px; }
+.legend i { width:8px; height:8px; border-radius:50%; }
+.visible-hotspots select { max-width:100%; margin-top:8px; }
+.flat-map > svg { padding:0 0 24px; }
+.map-tools { overflow:visible; }
+.map-tools button { width:44px; height:44px; }
+.lower { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.timeline { flex-wrap:wrap; gap:10px 14px; }
+.timeline input { min-width:65px; }
+.calendar { grid-template-columns:repeat(7,minmax(0,1fr)); }
+.calendar button { min-width:0; padding-inline:0; }
+.comparison-metrics { margin-top:12px; gap:16px 28px; }
+.comparison .header-actions { align-items:end; }
+[data-theme="light"] :is(.map-toolbar,.group-panel) { background:#fff; border-color:#ccd9e9; }
+
+@media(max-width:1050px) { .lower { grid-template-columns:minmax(0,1fr); } }
+@media(max-width:700px) {
+  header { flex-direction:column; margin-bottom:16px; }
+  header .header-actions { justify-content:flex-start; }
+  .mobile-nav { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; }
+  .mobile-nav a { padding:10px 12px; border:1px solid #45658e; border-radius:7px; font-size:13px; }
+  .map-toolbar { display:grid; align-items:start; padding:12px; gap:12px; }
+  .map-filters { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+  .map-filters:not(.map-display) label:first-child { grid-column:1 / -1; }
+  .map-display { margin-inline-start:0; }
+  .map-caption { padding:12px; gap:10px; }
+  .panel { padding:16px; }
+  .timeline small { flex-basis:100%; }
+  .globe { height:clamp(290px,85vw,410px); }
+}
+
